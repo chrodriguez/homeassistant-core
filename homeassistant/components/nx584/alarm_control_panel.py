@@ -2,9 +2,8 @@
 
 from datetime import timedelta
 import logging
-from typing import override
+from typing import TYPE_CHECKING, override
 
-from nx584 import client
 import probatio
 import requests
 
@@ -17,18 +16,22 @@ from homeassistant.components.alarm_control_panel import (
 )
 from homeassistant.const import CONF_HOST, CONF_NAME, CONF_PORT
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import PlatformNotReady
 from homeassistant.helpers import config_validation as cv
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.entity_platform import (
+    AddConfigEntryEntitiesCallback,
+    AddEntitiesCallback,
+)
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
+
+from .const import DEFAULT_HOST, DEFAULT_NAME, DEFAULT_PORT
+from .entity import NX584Entity
+
+if TYPE_CHECKING:
+    from . import NX584ConfigEntry
 
 _LOGGER = logging.getLogger(__name__)
 
 SCAN_INTERVAL = timedelta(seconds=10)
-
-DEFAULT_HOST = "localhost"
-DEFAULT_NAME = "NX584"
-DEFAULT_PORT = 5007
 
 PLATFORM_SCHEMA = ALARM_CONTROL_PANEL_PLATFORM_SCHEMA.extend(
     {
@@ -45,30 +48,26 @@ async def async_setup_platform(
     async_add_entities: AddEntitiesCallback,
     discovery_info: DiscoveryInfoType | None = None,
 ) -> None:
-    """Set up the NX584 platform."""
-    name: str = config[CONF_NAME]
-    host: str = config[CONF_HOST]
-    port: int = config[CONF_PORT]
+    """Set up the YAML platform.
 
-    url = f"http://{host}:{port}"
-
-    try:
-        alarm_client = client.Client(url)
-        await hass.async_add_executor_job(alarm_client.list_zones)
-    except requests.exceptions.ConnectionError as ex:
-        _LOGGER.error(
-            "Unable to connect to %(host)s: %(reason)s",
-            {"host": url, "reason": ex},
-        )
-        raise PlatformNotReady from ex
-
-    entity = NX584Alarm(name, alarm_client, url)
-    async_add_entities([entity])
+    The YAML configuration is imported into a config entry by the integration
+    setup; the entities are created from that entry.
+    """
 
 
-class NX584Alarm(AlarmControlPanelEntity):
+async def async_setup_entry(
+    hass: HomeAssistant,
+    entry: NX584ConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Set up the NX584 alarm control panel from a config entry."""
+    async_add_entities([NX584Alarm(entry)])
+
+
+class NX584Alarm(NX584Entity, AlarmControlPanelEntity):
     """Representation of a NX584-based alarm panel."""
 
+    _attr_name = None
     _attr_code_format = CodeFormat.NUMBER
     _attr_supported_features = (
         AlarmControlPanelEntityFeature.ARM_HOME
@@ -76,11 +75,11 @@ class NX584Alarm(AlarmControlPanelEntity):
     )
     _attr_code_arm_required = False
 
-    def __init__(self, name: str, alarm_client: client.Client, url: str) -> None:
+    def __init__(self, entry: NX584ConfigEntry) -> None:
         """Init the nx584 alarm panel."""
-        self._attr_name = name
-        self._alarm = alarm_client
-        self._url = url
+        super().__init__(entry, "alarm")
+        self._alarm = entry.runtime_data.client
+        self._url = f"http://{entry.data[CONF_HOST]}:{entry.data[CONF_PORT]}"
 
     def update(self) -> None:
         """Process new events from panel."""

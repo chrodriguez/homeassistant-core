@@ -2,8 +2,7 @@
 
 import logging
 import threading
-import time
-from typing import Any, override
+from typing import TYPE_CHECKING, Any, override
 
 from nx584 import client as nx584_client
 import probatio
@@ -18,16 +17,20 @@ from homeassistant.components.binary_sensor import (
 from homeassistant.const import CONF_HOST, CONF_PORT
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import config_validation as cv
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.entity_platform import (
+    AddConfigEntryEntitiesCallback,
+    AddEntitiesCallback,
+)
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
+
+from .const import CONF_EXCLUDE_ZONES, CONF_ZONE_TYPES, DEFAULT_HOST, DEFAULT_PORT
+from .entity import NX584Entity
+
+if TYPE_CHECKING:
+    from . import NX584ConfigEntry
 
 _LOGGER = logging.getLogger(__name__)
 
-CONF_EXCLUDE_ZONES = "exclude_zones"
-CONF_ZONE_TYPES = "zone_types"
-
-DEFAULT_HOST = "localhost"
-DEFAULT_PORT = 5007
 BYPASS_ZONE_FLAGS = {"Bypass", "Inhibit"}
 
 ZONE_TYPES_SCHEMA = probatio.Schema(
@@ -51,63 +54,69 @@ def _zone_flags_indicate_bypass(zone_flags: list[str]) -> bool:
     return not BYPASS_ZONE_FLAGS.isdisjoint(zone_flags)
 
 
-def setup_platform(
+async def async_setup_platform(
     hass: HomeAssistant,
     config: ConfigType,
-    add_entities: AddEntitiesCallback,
+    async_add_entities: AddEntitiesCallback,
     discovery_info: DiscoveryInfoType | None = None,
 ) -> None:
-    """Set up the NX584 binary sensor platform."""
+    """Set up the YAML platform.
 
-    host: str = config[CONF_HOST]
-    port: int = config[CONF_PORT]
-    exclude: list[int] = config[CONF_EXCLUDE_ZONES]
-    zone_types: dict[int, BinarySensorDeviceClass] = config[CONF_ZONE_TYPES]
+    The YAML configuration is imported into a config entry by the integration
+    setup; the entities are created from that entry.
+    """
 
-    try:
-        client = nx584_client.Client(f"http://{host}:{port}")
-        zones = client.list_zones()
-    except requests.exceptions.ConnectionError as ex:
-        _LOGGER.error("Unable to connect to NX584: %s", str(ex))
-        return
 
-    version = [int(v) for v in client.get_version().split(".")]
-    if version < [1, 1]:
+async def async_setup_entry(
+    hass: HomeAssistant,
+    entry: NX584ConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Set up the NX584 zone sensors from a config entry."""
+    data = entry.runtime_data
+    if [int(v) for v in data.version.split(".")] < [1, 1]:
         _LOGGER.error("NX584 is too old to use for sensors (>=0.2 required)")
         return
 
+    exclude: list[int] = entry.options.get(CONF_EXCLUDE_ZONES, [])
+    zone_types: dict[str, str] = entry.options.get(CONF_ZONE_TYPES, {})
     zone_sensors = {
         zone["number"]: NX584ZoneSensor(
-            zone, zone_types.get(zone["number"], BinarySensorDeviceClass.OPENING)
+            entry,
+            zone,
+            BinarySensorDeviceClass(
+                zone_types.get(str(zone["number"]), BinarySensorDeviceClass.OPENING)
+            ),
         )
-        for zone in zones
+        for zone in data.zones
         if zone["number"] not in exclude
     }
-    if zone_sensors:
-        add_entities(zone_sensors.values())
-        watcher = NX584Watcher(client, zone_sensors)
-        watcher.start()
-    else:
+    if not zone_sensors:
         _LOGGER.warning("No zones found on NX584")
+        return
+
+    async_add_entities(zone_sensors.values())
+    watcher = NX584Watcher(data.client, zone_sensors)
+    entry.async_on_unload(watcher.stop)
+    watcher.start()
 
 
-class NX584ZoneSensor(BinarySensorEntity):
+class NX584ZoneSensor(NX584Entity, BinarySensorEntity):
     """Representation of a NX584 zone as a sensor."""
 
     _attr_should_poll = False
 
     def __init__(
-        self, zone: dict[str, Any], zone_type: BinarySensorDeviceClass
+        self,
+        entry: NX584ConfigEntry,
+        zone: dict[str, Any],
+        zone_type: BinarySensorDeviceClass,
     ) -> None:
-        """Initialize the nx594 binary sensor."""
+        """Initialize the nx584 binary sensor."""
+        super().__init__(entry, f"zone_{zone['number']}")
         self._zone = zone
+        self._attr_name = zone["name"]
         self._attr_device_class = zone_type
-
-    @property
-    @override
-    def name(self):
-        """Return the name of the binary sensor."""
-        return self._zone["name"]
 
     @property
     @override
@@ -129,12 +138,20 @@ class NX584ZoneSensor(BinarySensorEntity):
 class NX584Watcher(threading.Thread):
     """Event listener thread to process NX584 events."""
 
-    def __init__(self, client, zone_sensors):
+    def __init__(
+        self,
+        client: nx584_client.Client,
+        zone_sensors: dict[int, NX584ZoneSensor],
+    ) -> None:
         """Initialize NX584 watcher thread."""
-        super().__init__()
-        self.daemon = True
+        super().__init__(name="nx584_watcher", daemon=True)
         self._client = client
         self._zone_sensors = zone_sensors
+        self._stop_event = threading.Event()
+
+    def stop(self) -> None:
+        """Ask the watcher to stop after the pending request returns."""
+        self._stop_event.set()
 
     def _process_zone_event(self, event):
         zone = event["zone"]
@@ -155,16 +172,17 @@ class NX584Watcher(threading.Thread):
     def _run(self):
         """Throw away any existing events so we don't replay history."""
         self._client.get_events()
-        while True:
-            if events := self._client.get_events():
+        while not self._stop_event.is_set():
+            events = self._client.get_events()
+            if events and not self._stop_event.is_set():
                 self._process_events(events)
 
     @override
     def run(self):
         """Run the watcher."""
-        while True:
+        while not self._stop_event.is_set():
             try:
                 self._run()
             except requests.exceptions.ConnectionError:
                 _LOGGER.error("Failed to reach NX584 server")
-                time.sleep(10)
+                self._stop_event.wait(10)
