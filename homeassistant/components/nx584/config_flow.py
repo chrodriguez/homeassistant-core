@@ -7,9 +7,21 @@ from nx584 import client as nx584_client
 import probatio
 import requests
 
-from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
+from homeassistant.components.binary_sensor import BinarySensorDeviceClass
+from homeassistant.config_entries import (
+    ConfigEntry,
+    ConfigFlow,
+    ConfigFlowResult,
+    OptionsFlowWithReload,
+)
 from homeassistant.const import CONF_HOST, CONF_NAME, CONF_PORT
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.selector import (
+    SelectOptionDict,
+    SelectSelector,
+    SelectSelectorConfig,
+    SelectSelectorMode,
+)
 
 from .const import (
     CONF_EXCLUDE_ZONES,
@@ -30,16 +42,25 @@ STEP_USER_DATA_SCHEMA = probatio.Schema(
 )
 
 
-async def _async_can_connect(hass: HomeAssistant, host: str, port: int) -> None:
-    """Check that the daemon answers; raise on failure."""
+async def _async_list_zones(
+    hass: HomeAssistant, host: str, port: int
+) -> list[dict[str, Any]]:
+    """Return the zones the daemon reports; raise if it cannot be reached."""
     client = nx584_client.Client(f"http://{host}:{port}")
-    await hass.async_add_executor_job(client.list_zones)
+    return await hass.async_add_executor_job(client.list_zones)
 
 
 class NX584ConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for NX584."""
 
     VERSION = 1
+
+    @staticmethod
+    @callback
+    @override
+    def async_get_options_flow(config_entry: ConfigEntry) -> NX584OptionsFlow:
+        """Create the options flow."""
+        return NX584OptionsFlow()
 
     @override
     async def async_step_user(
@@ -54,7 +75,7 @@ class NX584ConfigFlow(ConfigFlow, domain=DOMAIN):
             self._async_abort_entries_match({CONF_HOST: host, CONF_PORT: port})
 
             try:
-                await _async_can_connect(self.hass, host, port)
+                await _async_list_zones(self.hass, host, port)
             except requests.exceptions.ConnectionError:
                 errors["base"] = "cannot_connect"
             except Exception:
@@ -97,7 +118,7 @@ class NX584ConfigFlow(ConfigFlow, domain=DOMAIN):
             return self.async_abort(reason="already_configured")
 
         try:
-            await _async_can_connect(self.hass, host, port)
+            await _async_list_zones(self.hass, host, port)
         except requests.exceptions.ConnectionError:
             return self.async_abort(reason="cannot_connect")
 
@@ -106,3 +127,108 @@ class NX584ConfigFlow(ConfigFlow, domain=DOMAIN):
             data={CONF_HOST: host, CONF_PORT: port},
             options=options,
         )
+
+
+class NX584OptionsFlow(OptionsFlowWithReload):
+    """Handle the zone options of an NX584 entry."""
+
+    def __init__(self) -> None:
+        """Initialize the options flow."""
+        self._zones: dict[int, str] = {}
+        self._exclude_zones: list[int] = []
+
+    @override
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Select the zones to exclude."""
+        if user_input is not None:
+            self._exclude_zones = sorted(
+                int(zone) for zone in user_input.get(CONF_EXCLUDE_ZONES, [])
+            )
+            return await self.async_step_zone_types()
+
+        data = self.config_entry.data
+        try:
+            zones = await _async_list_zones(self.hass, data[CONF_HOST], data[CONF_PORT])
+        except requests.exceptions.ConnectionError:
+            return self.async_abort(reason="cannot_connect")
+        self._zones = {zone["number"]: zone["name"] for zone in zones}
+
+        schema = probatio.Schema(
+            {
+                probatio.Optional(CONF_EXCLUDE_ZONES): SelectSelector(
+                    SelectSelectorConfig(
+                        options=[
+                            SelectOptionDict(value=str(number), label=label)
+                            for number, label in self._zone_labels().items()
+                        ],
+                        multiple=True,
+                        mode=SelectSelectorMode.LIST,
+                    )
+                )
+            }
+        )
+        # Zones the daemon no longer reports are dropped from the selection.
+        excluded = [
+            str(number)
+            for number in self.config_entry.options.get(CONF_EXCLUDE_ZONES, [])
+            if number in self._zones
+        ]
+        return self.async_show_form(
+            step_id="init",
+            data_schema=self.add_suggested_values_to_schema(
+                schema, {CONF_EXCLUDE_ZONES: excluded}
+            ),
+        )
+
+    async def async_step_zone_types(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Select the type of each zone that is not excluded."""
+        # The zone label is the field key so the form shows which zone it is.
+        labels = {
+            number: label
+            for number, label in self._zone_labels().items()
+            if number not in self._exclude_zones
+        }
+        if user_input is not None:
+            return self.async_create_entry(
+                data={
+                    CONF_EXCLUDE_ZONES: self._exclude_zones,
+                    CONF_ZONE_TYPES: {
+                        str(number): user_input[label]
+                        for number, label in labels.items()
+                    },
+                }
+            )
+
+        zone_types: dict[str, str] = self.config_entry.options.get(CONF_ZONE_TYPES, {})
+        device_class_selector = SelectSelector(
+            SelectSelectorConfig(
+                options=[
+                    device_class.value for device_class in BinarySensorDeviceClass
+                ],
+                mode=SelectSelectorMode.DROPDOWN,
+                translation_key="device_class",
+                sort=True,
+            )
+        )
+        return self.async_show_form(
+            step_id="zone_types",
+            data_schema=probatio.Schema(
+                {
+                    probatio.Required(
+                        label,
+                        default=zone_types.get(
+                            str(number), BinarySensorDeviceClass.OPENING.value
+                        ),
+                    ): device_class_selector
+                    for number, label in labels.items()
+                }
+            ),
+        )
+
+    def _zone_labels(self) -> dict[int, str]:
+        """Return a readable label for each zone, by zone number."""
+        return {number: f"{number} – {name}" for number, name in self._zones.items()}

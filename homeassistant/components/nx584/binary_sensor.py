@@ -10,20 +10,27 @@ import requests
 
 from homeassistant.components.binary_sensor import (
     DEVICE_CLASSES_SCHEMA as BINARY_SENSOR_DEVICE_CLASSES_SCHEMA,
+    DOMAIN as BINARY_SENSOR_DOMAIN,
     PLATFORM_SCHEMA as BINARY_SENSOR_PLATFORM_SCHEMA,
     BinarySensorDeviceClass,
     BinarySensorEntity,
 )
 from homeassistant.const import CONF_HOST, CONF_PORT
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers import config_validation as cv, entity_registry as er
 from homeassistant.helpers.entity_platform import (
     AddConfigEntryEntitiesCallback,
     AddEntitiesCallback,
 )
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 
-from .const import CONF_EXCLUDE_ZONES, CONF_ZONE_TYPES, DEFAULT_HOST, DEFAULT_PORT
+from .const import (
+    CONF_EXCLUDE_ZONES,
+    CONF_ZONE_TYPES,
+    DEFAULT_HOST,
+    DEFAULT_PORT,
+    DOMAIN,
+)
 from .entity import NX584Entity
 
 if TYPE_CHECKING:
@@ -79,6 +86,12 @@ async def async_setup_entry(
         return
 
     exclude: list[int] = entry.options.get(CONF_EXCLUDE_ZONES, [])
+    entity_registry = er.async_get(hass)
+    for zone_number in exclude:
+        if entity_id := entity_registry.async_get_entity_id(
+            BINARY_SENSOR_DOMAIN, DOMAIN, f"{entry.entry_id}_zone_{zone_number}"
+        ):
+            entity_registry.async_remove(entity_id)
     zone_types: dict[str, str] = entry.options.get(CONF_ZONE_TYPES, {})
     zone_sensors = {
         zone["number"]: NX584ZoneSensor(

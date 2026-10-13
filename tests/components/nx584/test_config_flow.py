@@ -1,15 +1,22 @@
 """Tests for the NX584 config flow."""
 
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
 import requests
 
 from homeassistant.components.nx584.const import DOMAIN
-from homeassistant.config_entries import SOURCE_IMPORT, SOURCE_USER
+from homeassistant.config_entries import (
+    SOURCE_IMPORT,
+    SOURCE_USER,
+    ConfigEntryState,
+    ConfigFlowResult,
+)
 from homeassistant.const import CONF_HOST, CONF_NAME, CONF_PORT
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.helpers import entity_registry as er
 
 from tests.common import MockConfigEntry
 
@@ -194,3 +201,101 @@ async def test_import_cannot_connect(
     assert result["type"] is FlowResultType.ABORT
     assert result["reason"] == "cannot_connect"
     assert not hass.config_entries.async_entries(DOMAIN)
+
+
+def _schema_defaults(result: ConfigFlowResult) -> dict[str, Any]:
+    """Return the default or suggested value of each form field."""
+    values: dict[str, Any] = {}
+    for key in result["data_schema"].schema:
+        if (suggested := (key.description or {}).get("suggested_value")) is not None:
+            values[str(key)] = suggested
+        elif callable(key.default):
+            values[str(key)] = key.default()
+    return values
+
+
+@pytest.mark.usefixtures("mock_watcher")
+async def test_options_flow(
+    hass: HomeAssistant,
+    init_integration: MockConfigEntry,
+    entity_registry: er.EntityRegistry,
+) -> None:
+    """Test excluding a zone and changing a zone type."""
+    assert entity_registry.async_get("binary_sensor.nx584_inside")
+
+    result = await hass.config_entries.options.async_init(init_integration.entry_id)
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "init"
+
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"exclude_zones": ["3"]}
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "zone_types"
+    assert _schema_defaults(result) == {"1 – front": "opening", "2 – back": "opening"}
+
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"1 – front": "door", "2 – back": "opening"}
+    )
+    await hass.async_block_till_done()
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert init_integration.options == {
+        "exclude_zones": [3],
+        "zone_types": {"1": "door", "2": "opening"},
+    }
+    assert init_integration.state is ConfigEntryState.LOADED
+    assert entity_registry.async_get("binary_sensor.nx584_inside") is None
+    assert hass.states.get("binary_sensor.nx584_inside") is None
+    assert (
+        hass.states.get("binary_sensor.nx584_front").attributes["device_class"]
+        == "door"
+    )
+
+
+@pytest.mark.usefixtures("mock_watcher")
+async def test_options_flow_cannot_connect(
+    hass: HomeAssistant,
+    init_integration: MockConfigEntry,
+    mock_nx584_client: MagicMock,
+) -> None:
+    """Test the options flow aborts when the daemon cannot be reached."""
+    mock_nx584_client.list_zones.side_effect = requests.exceptions.ConnectionError
+
+    result = await hass.config_entries.options.async_init(init_integration.entry_id)
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "cannot_connect"
+
+
+@pytest.mark.usefixtures("mock_nx584_client", "mock_watcher")
+async def test_options_prefilled_from_import(hass: HomeAssistant) -> None:
+    """Test the form starts from the stored options, ignoring unknown zones."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data=USER_INPUT,
+        title="NX584",
+        options={"exclude_zones": [3, 9], "zone_types": {"1": "door"}},
+    )
+    entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    assert _schema_defaults(result) == {"exclude_zones": ["3"]}
+
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"exclude_zones": ["3"]}
+    )
+    assert _schema_defaults(result) == {"1 – front": "door", "2 – back": "opening"}
+
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"1 – front": "door", "2 – back": "opening"}
+    )
+    await hass.async_block_till_done()
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert entry.options == {
+        "exclude_zones": [3],
+        "zone_types": {"1": "door", "2": "opening"},
+    }
