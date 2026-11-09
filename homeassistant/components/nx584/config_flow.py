@@ -6,11 +6,17 @@ from typing import Any, override
 import probatio
 import requests
 
+from homeassistant.components.alarm_control_panel import (
+    DOMAIN as ALARM_CONTROL_PANEL_DOMAIN,
+)
+from homeassistant.components.binary_sensor import DOMAIN as BINARY_SENSOR_DOMAIN
 from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 from homeassistant.const import CONF_HOST, CONF_NAME, CONF_PORT
+from homeassistant.core import callback
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.typing import Undefined
 
-from . import NX584ConfigEntry, create_client
+from . import DATA_IMPORTED_ENTRIES, NX584ConfigEntry, create_client
 from .const import (
     CONF_EXCLUDE_ZONES,
     CONF_ZONE_TYPES,
@@ -84,6 +90,35 @@ class NX584ConfigFlow(ConfigFlow, domain=DOMAIN):
             errors=errors,
         )
 
+    @callback
+    def _async_update_imported_entities(
+        self, entry: NX584ConfigEntry, name: str | None, options: dict[str, Any]
+    ) -> None:
+        """Apply this platform's settings to the entities of an entry just imported.
+
+        The other platform's import set up the entry first, and the registry
+        applies the defaults of an entity only when it registers it.
+        """
+        entity_registry = er.async_get(self.hass)
+        for zone in options.get(CONF_EXCLUDE_ZONES, []):
+            if entity_id := entity_registry.async_get_entity_id(
+                BINARY_SENSOR_DOMAIN, DOMAIN, f"{entry.entry_id}_zone_{zone}"
+            ):
+                entity_registry.async_update_entity(
+                    entity_id, disabled_by=er.RegistryEntryDisabler.INTEGRATION
+                )
+        if name and (
+            entity_id := entity_registry.async_get_entity_id(
+                ALARM_CONTROL_PANEL_DOMAIN, DOMAIN, f"{entry.entry_id}_alarm"
+            )
+        ):
+            entity_registry.async_update_entity(
+                entity_id,
+                new_entity_id=entity_registry.async_get_available_entity_id(
+                    ALARM_CONTROL_PANEL_DOMAIN, name, current_entity_id=entity_id
+                ),
+            )
+
     async def async_step_import(self, import_data: dict[str, Any]) -> ConfigFlowResult:
         """Import the YAML configuration of one platform."""
         host: str = import_data[CONF_HOST]
@@ -111,6 +146,8 @@ class NX584ConfigFlow(ConfigFlow, domain=DOMAIN):
 
         # Checked after the validation, as a user flow may set up the server meanwhile.
         if entry := self._async_entry_for_server(host, port):
+            if entry.entry_id in self.hass.data.get(DATA_IMPORTED_ENTRIES, set()):
+                self._async_update_imported_entities(entry, name, options)
             # Each platform owns its keys; the other platform's keys are kept.
             return self.async_update_reload_and_abort(
                 entry,

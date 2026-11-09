@@ -85,15 +85,18 @@ async def async_setup_entry(
         _LOGGER.error("NX584 is too old to use for sensors (>=0.2 required)")
         return
 
+    # The imported zone settings are only defaults, the user can change them
+    # in the entity settings.
     zone_sensors = {
         zone["number"]: NX584ZoneSensor(
+            entry,
             zone,
             BinarySensorDeviceClass(
                 zone_types.get(str(zone["number"]), BinarySensorDeviceClass.OPENING)
             ),
+            zone["number"] not in exclude,
         )
         for zone in data.zones
-        if zone["number"] not in exclude
     }
     if zone_sensors:
         async_add_entities(zone_sensors.values())
@@ -113,11 +116,17 @@ class NX584ZoneSensor(BinarySensorEntity):
     _attr_should_poll = False
 
     def __init__(
-        self, zone: dict[str, Any], zone_type: BinarySensorDeviceClass
+        self,
+        entry: NX584ConfigEntry,
+        zone: dict[str, Any],
+        zone_type: BinarySensorDeviceClass,
+        enabled_default: bool,
     ) -> None:
         """Initialize the nx594 binary sensor."""
+        self._attr_unique_id = f"{entry.entry_id}_zone_{zone['number']}"
         self._zone = zone
         self._attr_device_class = zone_type
+        self._attr_entity_registry_enabled_default = enabled_default
 
     @property
     @override
@@ -166,7 +175,10 @@ class NX584Watcher(threading.Thread):
             zone_sensor._zone["bypassed"] = _zone_flags_indicate_bypass(  # noqa: SLF001
                 event["zone_flags"]
             )
-        zone_sensor.schedule_update_ha_state()
+        # A zone disabled at setup is never added, and one disabled later is
+        # removed without a reload of the entry.
+        if zone_sensor.hass is not None and zone_sensor.enabled:
+            zone_sensor.schedule_update_ha_state()
 
     def _process_events(self, events):
         for event in events:

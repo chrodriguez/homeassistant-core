@@ -9,11 +9,15 @@ import pytest
 from pytest_homeassistant.common import MockConfigEntry
 import requests
 
-from homeassistant.components.binary_sensor import DOMAIN as BINARY_SENSOR_DOMAIN
+from homeassistant.components.binary_sensor import (
+    DOMAIN as BINARY_SENSOR_DOMAIN,
+    BinarySensorDeviceClass,
+)
 from homeassistant.components.nx584 import binary_sensor as nx584
 from homeassistant.components.nx584.const import DOMAIN
 from homeassistant.const import CONF_HOST, CONF_PORT
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.setup import async_setup_component
 
 from .conftest import TEST_HOST, TEST_PORT
@@ -50,11 +54,36 @@ async def test_nx584_sensor_setup_defaults(
     mock_watcher.return_value.start.assert_called_once()
 
 
+@pytest.mark.usefixtures("mock_client", "mock_watcher")
+async def test_nx584_sensor_unique_ids(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    entity_registry: er.EntityRegistry,
+    device_registry: dr.DeviceRegistry,
+) -> None:
+    """Test the zone sensors have unique IDs and keep their entity IDs."""
+    await _async_setup_entry(hass, mock_config_entry)
+
+    for number, entity_id in (
+        (1, "binary_sensor.front"),
+        (2, "binary_sensor.back"),
+        (3, "binary_sensor.inside"),
+    ):
+        entity = entity_registry.async_get(entity_id)
+        assert entity
+        assert entity.unique_id == f"{mock_config_entry.entry_id}_zone_{number}"
+        assert hass.states.get(entity_id).name == entity.original_name
+    # A device would add its name to the entity IDs.
+    assert not dr.async_entries_for_config_entry(
+        device_registry, mock_config_entry.entry_id
+    )
+
+
 @pytest.mark.usefixtures("mock_client")
 async def test_nx584_sensor_setup_zone_options(
-    hass: HomeAssistant, mock_watcher: MagicMock
+    hass: HomeAssistant, mock_watcher: MagicMock, entity_registry: er.EntityRegistry
 ) -> None:
-    """Test the zone options apply with the string keys a stored entry has."""
+    """Test the zone options set the defaults with the string keys of an entry."""
     entry = MockConfigEntry(
         domain=DOMAIN,
         data={CONF_HOST: TEST_HOST, CONF_PORT: TEST_PORT},
@@ -65,11 +94,125 @@ async def test_nx584_sensor_setup_zone_options(
     assert hass.states.get("binary_sensor.front").attributes["device_class"] == (
         "opening"
     )
-    assert hass.states.get("binary_sensor.back") is None
     assert hass.states.get("binary_sensor.inside").attributes["device_class"] == (
         "motion"
     )
-    assert sorted(mock_watcher.call_args.args[1]) == [1, 3]
+    back = entity_registry.async_get("binary_sensor.back")
+    assert back
+    assert back.disabled_by is er.RegistryEntryDisabler.INTEGRATION
+    assert hass.states.get("binary_sensor.back") is None
+    assert sorted(mock_watcher.call_args.args[1]) == [1, 2, 3]
+
+
+@pytest.mark.usefixtures("mock_client", "mock_watcher")
+async def test_nx584_sensor_enabled_zone_stays_enabled(
+    hass: HomeAssistant, entity_registry: er.EntityRegistry
+) -> None:
+    """Test an excluded zone the user enables stays enabled after a reload."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={CONF_HOST: TEST_HOST, CONF_PORT: TEST_PORT},
+        options=ZONE_OPTIONS,
+    )
+    await _async_setup_entry(hass, entry)
+
+    entity_registry.async_update_entity("binary_sensor.back", disabled_by=None)
+    assert await hass.config_entries.async_reload(entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert hass.states.get("binary_sensor.back")
+
+
+@pytest.mark.usefixtures("mock_client", "mock_watcher")
+async def test_nx584_sensor_show_as_overrides_zone_type(
+    hass: HomeAssistant, entity_registry: er.EntityRegistry
+) -> None:
+    """Test a device class set by the user wins over the imported zone type."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={CONF_HOST: TEST_HOST, CONF_PORT: TEST_PORT},
+        options=ZONE_OPTIONS,
+    )
+    await _async_setup_entry(hass, entry)
+
+    entity_registry.async_update_entity(
+        "binary_sensor.inside", device_class=BinarySensorDeviceClass.DOOR
+    )
+    assert await hass.config_entries.async_reload(entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert hass.states.get("binary_sensor.inside").attributes["device_class"] == (
+        "door"
+    )
+
+
+@pytest.mark.usefixtures("mock_client", "mock_watcher")
+async def test_nx584_sensor_two_entries(
+    hass: HomeAssistant, entity_registry: er.EntityRegistry
+) -> None:
+    """Test two servers with the same zone numbers do not collide."""
+    entries = [
+        MockConfigEntry(domain=DOMAIN, data={CONF_HOST: host, CONF_PORT: TEST_PORT})
+        for host in (TEST_HOST, "192.168.1.11")
+    ]
+    for entry in entries:
+        await _async_setup_entry(hass, entry)
+
+    for entry in entries:
+        assert {
+            entity.unique_id
+            for entity in er.async_entries_for_config_entry(
+                entity_registry, entry.entry_id
+            )
+            if entity.domain == BINARY_SENSOR_DOMAIN
+        } == {f"{entry.entry_id}_zone_{number}" for number in (1, 2, 3)}
+    assert len(hass.states.async_entity_ids(BINARY_SENSOR_DOMAIN)) == 6
+
+
+@pytest.mark.usefixtures("mock_client")
+async def test_nx584_watcher_event_for_zone_disabled_after_setup(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    entity_registry: er.EntityRegistry,
+) -> None:
+    """Test an event for a zone the user disabled after setup is not written."""
+    with mock.patch.object(nx584.NX584Watcher, "start", autospec=True) as start:
+        await _async_setup_entry(hass, mock_config_entry)
+    watcher: nx584.NX584Watcher = start.call_args.args[0]
+    entity_registry.async_update_entity(
+        "binary_sensor.front", disabled_by=er.RegistryEntryDisabler.USER
+    )
+    await hass.async_block_till_done()
+
+    with mock.patch.object(
+        nx584.NX584ZoneSensor, "schedule_update_ha_state"
+    ) as mock_update:
+        watcher._process_zone_event({"zone": 1, "zone_state": True})
+
+    assert not mock_update.called
+
+
+@pytest.mark.usefixtures("mock_client")
+async def test_nx584_watcher_event_for_disabled_zone(
+    hass: HomeAssistant, fake_zones: list[dict[str, Any]]
+) -> None:
+    """Test an event for a disabled zone updates its data without a state."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={CONF_HOST: TEST_HOST, CONF_PORT: TEST_PORT},
+        options=ZONE_OPTIONS,
+    )
+    with mock.patch.object(nx584.NX584Watcher, "start", autospec=True) as start:
+        await _async_setup_entry(hass, entry)
+    watcher: nx584.NX584Watcher = start.call_args.args[0]
+
+    watcher._process_zone_event({"zone": 2, "zone_state": True})
+    watcher._process_zone_event({"zone": 1, "zone_state": True})
+    await hass.async_block_till_done()
+
+    assert fake_zones[1]["state"]
+    assert hass.states.get("binary_sensor.back") is None
+    assert hass.states.get("binary_sensor.front").state == "on"
 
 
 @pytest.mark.usefixtures("mock_client")
@@ -125,10 +268,10 @@ async def test_nx584_sensor_setup_no_zones(
     assert not mock_watcher.called
 
 
-def test_nx584_zone_sensor_normal() -> None:
+def test_nx584_zone_sensor_normal(mock_config_entry: MockConfigEntry) -> None:
     """Test for the NX584 zone sensor."""
     zone = {"number": 1, "name": "foo", "state": True}
-    sensor = nx584.NX584ZoneSensor(zone, "motion")
+    sensor = nx584.NX584ZoneSensor(mock_config_entry, zone, "motion", True)
     assert sensor.name == "foo"
     assert not sensor.should_poll
     assert sensor.is_on
@@ -139,10 +282,10 @@ def test_nx584_zone_sensor_normal() -> None:
     assert not sensor.is_on
 
 
-def test_nx584_zone_sensor_bypassed() -> None:
+def test_nx584_zone_sensor_bypassed(mock_config_entry: MockConfigEntry) -> None:
     """Test for the NX584 zone sensor."""
     zone = {"number": 1, "name": "foo", "state": True, "bypassed": True}
-    sensor = nx584.NX584ZoneSensor(zone, "motion")
+    sensor = nx584.NX584ZoneSensor(mock_config_entry, zone, "motion", True)
     assert sensor.name == "foo"
     assert not sensor.should_poll
     assert sensor.is_on
@@ -156,14 +299,19 @@ def test_nx584_zone_sensor_bypassed() -> None:
 
 
 @mock.patch.object(nx584.NX584ZoneSensor, "schedule_update_ha_state")
-def test_nx584_watcher_process_zone_event(mock_update) -> None:
+def test_nx584_watcher_process_zone_event(
+    mock_update: MagicMock, mock_config_entry: MockConfigEntry
+) -> None:
     """Test the processing of zone events."""
     zone1 = {"number": 1, "name": "foo", "state": True}
     zone2 = {"number": 2, "name": "bar", "state": True}
     zones = {
-        1: nx584.NX584ZoneSensor(zone1, "motion"),
-        2: nx584.NX584ZoneSensor(zone2, "motion"),
+        1: nx584.NX584ZoneSensor(mock_config_entry, zone1, "motion", True),
+        2: nx584.NX584ZoneSensor(mock_config_entry, zone2, "motion", True),
     }
+    for sensor in zones.values():
+        # Only sensors added to Home Assistant get a state update.
+        sensor.hass = MagicMock()
     watcher = nx584.NX584Watcher(None, zones)
     watcher._process_zone_event({"zone": 1, "zone_state": False})
     assert not zone1["state"]
@@ -171,10 +319,14 @@ def test_nx584_watcher_process_zone_event(mock_update) -> None:
 
 
 @mock.patch.object(nx584.NX584ZoneSensor, "schedule_update_ha_state")
-def test_nx584_watcher_process_zone_event_updates_bypass(mock_update) -> None:
+def test_nx584_watcher_process_zone_event_updates_bypass(
+    mock_update: MagicMock, mock_config_entry: MockConfigEntry
+) -> None:
     """Test the processing of zone events updates bypass state."""
     zone = {"number": 1, "name": "foo", "state": True, "bypassed": False}
-    zones = {1: nx584.NX584ZoneSensor(zone, "motion")}
+    zones = {1: nx584.NX584ZoneSensor(mock_config_entry, zone, "motion", True)}
+    # Only sensors added to Home Assistant get a state update.
+    zones[1].hass = MagicMock()
     watcher = nx584.NX584Watcher(None, zones)
 
     watcher._process_zone_event(

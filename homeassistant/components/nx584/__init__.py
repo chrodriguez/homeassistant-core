@@ -25,6 +25,8 @@ CONFIG_SCHEMA = cv.platform_only_config_schema(DOMAIN)
 PLATFORMS = [Platform.ALARM_CONTROL_PANEL, Platform.BINARY_SENSOR]
 
 DATA_IMPORT_LOCK: HassKey[asyncio.Lock] = HassKey(f"{DOMAIN}_import_lock")
+# Entries the YAML import created since Home Assistant started.
+DATA_IMPORTED_ENTRIES: HassKey[set[str]] = HassKey(f"{DOMAIN}_imported_entries")
 
 
 @dataclass
@@ -86,6 +88,10 @@ async def async_import_yaml(hass: HomeAssistant, import_data: dict[str, Any]) ->
             context={"source": SOURCE_IMPORT},
             data=import_data,
         )
+        if result["type"] is FlowResultType.CREATE_ENTRY:
+            hass.data.setdefault(DATA_IMPORTED_ENTRIES, set()).add(
+                result["result"].entry_id
+            )
 
     if (
         result["type"] is FlowResultType.ABORT

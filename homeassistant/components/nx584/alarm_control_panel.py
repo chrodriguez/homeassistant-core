@@ -63,7 +63,7 @@ async def async_setup_entry(
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up the NX584 alarm panel from a config entry."""
-    async_add_entities([NX584Alarm(entry.title, entry.runtime_data.client)])
+    async_add_entities([NX584Alarm(entry, entry.runtime_data.client)])
 
 
 class NX584Alarm(AlarmControlPanelEntity):
@@ -76,9 +76,10 @@ class NX584Alarm(AlarmControlPanelEntity):
     )
     _attr_code_arm_required = False
 
-    def __init__(self, name: str, alarm_client: client.Client) -> None:
+    def __init__(self, entry: NX584ConfigEntry, alarm_client: client.Client) -> None:
         """Init the nx584 alarm panel."""
-        self._attr_name = name
+        self._attr_unique_id = f"{entry.entry_id}_alarm"
+        self._attr_name = entry.title
         self._alarm = alarm_client
 
     def update(self) -> None:
